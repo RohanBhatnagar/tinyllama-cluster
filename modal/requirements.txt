@@ -1,0 +1,8 @@
+numpy==1.24.4
+torch==2.1.2
+transformers==4.33.3
+tokenizers==0.13.3
+datasets==2.18.0
+scikit-learn==1.3.2
+k-means-constrained==0.7.2
+accelerate==0.23.0
