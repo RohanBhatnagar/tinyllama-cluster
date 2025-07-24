@@ -17,6 +17,12 @@ image = (
     .add_local_file("architecture.py", remote_path="/root/architecture.py")
 )
 
+with image.imports():
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from k_means_constrained import KMeansConstrained
+    import os 
+
 experts = modal.Volume.from_name("tinyllama-experts", create_if_missing=True)
 
 app = modal.App("emoe")
@@ -24,14 +30,9 @@ app = modal.App("emoe")
 @app.function(
     image=image,
     volumes={"/outputs": experts},
-    timeout=600,
-    scaledown_window=300,
+    timeout=30, # 30 seconds 
 )
 def cluster_neurons(num_experts: int, layer_idx: int):
-    import torch
-    from transformers import AutoModelForCausalLM
-    from k_means_constrained import KMeansConstrained
-
     os.makedirs(f"/outputs/{num_experts}_Experts", exist_ok=True)
     
     print(f"Clustering neurons for layer {layer_idx} into {num_experts} experts")
@@ -40,7 +41,6 @@ def cluster_neurons(num_experts: int, layer_idx: int):
     
     print("Model loaded!")
     
-    # Use gate_proj for clustering (following reference implementation)
     weights = model.model.layers[layer_idx].mlp.gate_proj.weight
     intermediate_dim = weights.shape[0] # 5632
     model_dim = weights.shape[1] # 2048
@@ -65,44 +65,6 @@ def cluster_neurons(num_experts: int, layer_idx: int):
     print(f"Saved clustering results for layer {layer_idx} to {file_name}")
     return res
 
-@app.function(
-    image=image,
-    volumes={"/outputs": experts}, 
-    timeout=300
-)
-def rearrange_neurons(weights: "torch.Tensor", layer_idx: int, num_experts: int, weight_type: str = "up_or_gate"):
-    """
-    Rearrange weights based on clustering index
-    weight_type: "up_or_gate" for gate_proj/up_proj, "down" for down_proj
-    """
-    import torch 
-    import os 
-    
-    file_path = f"/outputs/{num_experts}_Experts/layer_{layer_idx}_{num_experts}E.pth"
-    index = torch.load(file_path)
-    print(f"✅ Loaded clustering for layer {layer_idx}: {index.shape}")
-    
-    dim1, dim2 = weights.shape
-    print(f"Rearranging {weight_type} weights: {weights.shape}")
-    
-    if weight_type == "up_or_gate":
-        # For gate_proj and up_proj: rearrange rows (dim1 > dim2: 5632 > 2048)
-        expert_size = dim1 // num_experts  # 704
-        new_weight = torch.zeros_like(weights)
-        for i in range(num_experts):
-            new_weight[i * expert_size: (i+1) * expert_size] = weights[index == i]
-        return new_weight
-    
-    elif weight_type == "down":
-        # For down_proj: transpose, rearrange, transpose back (dim1 < dim2: 2048 < 5632)
-        expert_size = dim2 // num_experts  # 704
-        new_weight = torch.zeros_like(weights.T)
-        for i in range(num_experts):
-            new_weight[i * expert_size: (i+1) * expert_size] = weights.T[index == i]
-        return new_weight.T
-    
-    else:
-        raise ValueError(f"Unknown weight_type: {weight_type}")
 
 @app.function(
     image=image,
@@ -121,33 +83,26 @@ def model_surgery(num_experts: int):
     tokenizer = AutoTokenizer.from_pretrained("TinyLlama/TinyLlama_v1.1") 
     print("Loaded model and tokenizer.")
     
-    # Check what clustering files are available
-    print("Available clustering files:")
-    os.system(f"find /outputs -name '*.pth' | head -10")
-    
     for idx, layer in enumerate(model.model.layers):
         print(f"Processing layer {idx}")
         
-        # Get all three MLP weights
         original_gate_proj = layer.mlp.gate_proj.weight  # (5632, 2048)
         original_up_proj = layer.mlp.up_proj.weight      # (5632, 2048) 
         original_down_proj = layer.mlp.down_proj.weight  # (2048, 5632)
         
         print(f"Original shapes - gate: {original_gate_proj.shape}, up: {original_up_proj.shape}, down: {original_down_proj.shape}")
         
-        # Apply same clustering index to all three weights
         new_gate_proj = rearrange_neurons.local(weights=original_gate_proj, layer_idx=idx, num_experts=num_experts, weight_type="up_or_gate")
         new_up_proj = rearrange_neurons.local(weights=original_up_proj, layer_idx=idx, num_experts=num_experts, weight_type="up_or_gate")
         new_down_proj = rearrange_neurons.local(weights=original_down_proj, layer_idx=idx, num_experts=num_experts, weight_type="down")
         
         print(f"New shapes - gate: {new_gate_proj.shape}, up: {new_up_proj.shape}, down: {new_down_proj.shape}")
         
-        # Update the layer weights directly (following reference approach)
         layer.mlp.gate_proj.weight.data = new_gate_proj
         layer.mlp.up_proj.weight.data = new_up_proj  
         layer.mlp.down_proj.weight.data = new_down_proj
         
-        print(f"✅ Updated layer {idx} MLP weights")
+        print(f"Updated layer {idx} MLP weights")
     
     print("Model surgery complete. Testing inference...")
     
@@ -159,68 +114,114 @@ def model_surgery(num_experts: int):
     print(f"Generated: {output_text}")
     return output_text
 
-@app.function(
-    image=image,
-    volumes={"/outputs": experts},
-    timeout=300
-)
-def inspect_cluster_file(layer_idx: int, num_experts: int):
-    import torch
-    import os
-
-    file_path = f"/outputs/{num_experts}_Experts/layer_{layer_idx}_{num_experts}E.pth"
-    
-    if not os.path.exists(file_path):
-        print(f"[!] File not found: {file_path}")
-        return
-
-    labels = torch.load(file_path)
-    
-    print(f"[✓] Loaded cluster assignments for layer {layer_idx} with {num_experts} experts.")
-    print(f"  - Shape: {labels.shape}")
-    print(f"  - Unique expert IDs: {torch.unique(labels).tolist()}")
-    print(f"  - Distribution:")
-    
-    for expert_id in torch.unique(labels):
-        count = (labels == expert_id).sum().item()
-        print(f"    Expert {expert_id.item()}: {count} neurons")
-
-    return labels.tolist()  # Optional: return for programmatic use
-
-
-
 @app.local_entrypoint()
 def main(
-    inspect: bool = False,
     rearrange: bool = False,
     cluster: bool = False,
     surgery: bool = False
 ):
+    num_experts = 8
+    
     if cluster:
         num_layers = 22
-        num_experts = 8
-        
         layer_args = [(num_experts, idx) for idx in range(num_layers)]
-        
         print(f"Starting parallel clustering for {num_layers} layers with {num_experts} experts each")
-        
         results = list(cluster_neurons.starmap(layer_args))
-        
         print(f"Completed clustering for all {num_layers} layers")
-        return results 
     
     if rearrange:
-        # Use remote functions only - no local model loading
-        new_weights = rearrange_neurons.remote(weights=None, layer_idx=1, num_experts=8)  # This needs fixing
-        model_surgery.remote(num_experts=8)
+        print("Rearranging neurons for all layers...")
+        result = rearrange_all_neurons.remote(num_experts=num_experts)
+        print(f"Rearrangement completed: {result}")
         
-    if surgery: 
-        # All processing happens in Modal
-        result = model_surgery.remote(num_experts=8)
-        print(f"Surgery result: {result}")
-        
-    if inspect:
-        result = inspect_cluster_file.remote(layer_idx=1, num_experts=8)
-        print(result)
+    if surgery:
+        print("Starting model surgery...")
+        result = model_surgery.remote(num_experts=num_experts)
+        print(f"Surgery completed: {result}")
 
+@app.function(
+    image=image,
+    volumes={"/outputs": experts},
+    gpu="A100",
+    timeout=1200,  # Longer timeout for processing all layers
+)
+def rearrange_all_neurons(num_experts: int):
+    """
+    cpu doesn't support fp16 flops so we need a gpu for this function. 
+    """
+    from collections import OrderedDict
     
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = AutoModelForCausalLM.from_pretrained("TinyLlama/TinyLlama_v1.1", torch_dtype=torch.float16).to(device)
+    tokenizer = AutoTokenizer.from_pretrained("TinyLlama/TinyLlama_v1.1")
+    
+    print("Model loaded! Beginning weight processing...")
+    
+    # new state dict with rearranged weights
+    sd = OrderedDict()
+    orig_weights = model.state_dict()
+    
+    for n, p in orig_weights.items():
+        if 'mlp' not in n:
+            sd[n] = p
+            continue
+        if n in sd:
+            continue
+
+        layer_idx = int(n.split('.')[2])
+        pfx = '.'.join(n.split('.')[:4]) 
+        
+        print(f"Processing {pfx}")
+        
+        gate_proj_weight = orig_weights[f'{pfx}.gate_proj.weight']
+        up_proj_weight = orig_weights[f'{pfx}.up_proj.weight']
+        down_proj_weight = orig_weights[f'{pfx}.down_proj.weight']
+        
+        file_path = f"/outputs/{num_experts}_Experts/layer_{layer_idx}_{num_experts}E.pth"
+        index = torch.load(file_path)
+        
+        sd[f'{pfx}.gate_proj.weight'] = rearrange_weights_direct(gate_proj_weight, index, num_experts, "up_or_gate")
+        sd[f'{pfx}.up_proj.weight'] = rearrange_weights_direct(up_proj_weight, index, num_experts, "up_or_gate")
+        sd[f'{pfx}.down_proj.weight'] = rearrange_weights_direct(down_proj_weight, index, num_experts, "down")
+    
+    model.load_state_dict(sd)
+    print("Loaded rearranged weights into model!")
+    
+    # make sure i didn't kill the model 
+    text = "Hello, how are you today?"
+    input_ids = tokenizer.encode(text, return_tensors="pt").to(model.device)
+    output_ids = model.generate(input_ids, max_new_tokens=50)
+    output_text = tokenizer.decode(output_ids[0], skip_special_tokens=True)
+    
+    print(f"Rearranged model generated: {output_text}")
+    
+    return {
+        "status": "success",
+        "processed_layers": 22,
+        "generated_text": output_text
+    }
+
+def rearrange_weights_direct(weights, index, num_experts, weight_type):
+    dim1, dim2 = weights.shape
+    
+    print(f"Rearranging {weight_type} weights: {weights.shape}")
+    
+    if weight_type == "up_or_gate":
+        # For gate_proj and up_proj: rearrange rows (5632 x 2048)
+        expert_size = dim1 // num_experts  # 704
+        new_weight = torch.zeros_like(weights)
+        for i in range(num_experts):
+            new_weight[i * expert_size: (i+1) * expert_size] = weights[index == i]
+        return new_weight
+    
+    elif weight_type == "down":
+        # For down_proj: transpose, rearrange, transpose back (2048 x 5632)
+        expert_size = dim2 // num_experts  # 704
+        new_weight = torch.zeros_like(weights.T)
+        for i in range(num_experts):
+            new_weight[i * expert_size: (i+1) * expert_size] = weights.T[index == i]
+        return new_weight.T
+    
+    else:
+        raise ValueError(f"Unknown weight_type: {weight_type}")
+
