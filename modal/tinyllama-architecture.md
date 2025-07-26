@@ -6,10 +6,10 @@ LlamaForCausalLM(
     (layers): ModuleList(
       (0-21): 22 x LlamaDecoderLayer(
         (self_attn): LlamaAttention(
-          (q_proj): Linear(in_features=2048, out_features=2048, bias=False)
-          (k_proj): Linear(in_features=2048, out_features=256, bias=False)
-          (v_proj): Linear(in_features=2048, out_features=256, bias=False)
-          (o_proj): Linear(in_features=2048, out_features=2048, bias=False)
+            (q_proj): Linear(in_features=2048, out_features=2048, bias=False)
+            (k_proj): Linear(in_features=2048, out_features=256, bias=False)
+            (v_proj): Linear(in_features=2048, out_features=256, bias=False)
+            (o_proj): Linear(in_features=2048, out_features=2048, bias=False)
         )
         (mlp): LlamaMLP(
           (gate_proj): Linear(in_features=2048, out_features=5632, bias=False)
