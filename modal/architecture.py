@@ -106,8 +106,8 @@ class MoELlamaDecoderLayer(LlamaDecoderLayer):
            and (l_idx - config.split_start_layer) % config.split_every_layer == 0:
             self.mlp = EMoELlamaMLP(config)
         else:
-            # fall back to your regular MoE MLP (or the original LlamaMLP)
-            self.mlp = MoELlamaMLP(config)
+            # fall back to the original LlamaMLP
+            self.mlp = LlamaMLP(config)
 
 
 class MoELlamadModel(LlamaModel):

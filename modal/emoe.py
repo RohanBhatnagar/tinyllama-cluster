@@ -13,12 +13,14 @@ image = (
     .apt_install("git")
     .pip_install("pip==24.0")
     .pip_install_from_requirements("requirements.txt")
+    .add_local_file("architecture.py", remote_path="/root/architecture.py")
 )
 
 with image.imports():
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from k_means_constrained import KMeansConstrained
+    import architecture
     import os 
 
 experts = modal.Volume.from_name("tinyllama-experts", create_if_missing=True)
@@ -30,6 +32,7 @@ app = modal.App("emoe")
 def main(
     cluster: bool = False,
     rearrange: bool = False,
+    train: bool = False,
     num_experts: int = 8,
     num_layers: int = 22
 ):
@@ -43,6 +46,11 @@ def main(
         print("Editing weights...")
         result = rearrange_all_neurons.remote(num_experts=num_experts)
         print(f"Rearrangement completed: {result}")
+    
+    if train:
+        print("Starting training to specialize experts...")
+        result = train_experts.remote(num_experts=num_experts)
+        print(f"Training completed: {result}")
         
 @app.function(
     image=image,
