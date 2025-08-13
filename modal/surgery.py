@@ -32,7 +32,6 @@ app = modal.App("emoe")
 def main(
     cluster: bool = False,
     rearrange: bool = False,
-    train: bool = False,
     num_experts: int = 8,
     num_layers: int = 22
 ):
@@ -46,11 +45,6 @@ def main(
         print("Editing weights...")
         result = rearrange_all_neurons.remote(num_experts=num_experts)
         print(f"Rearrangement completed: {result}")
-    
-    if train:
-        print("Starting training to specialize experts...")
-        result = train_experts.remote(num_experts=num_experts)
-        print(f"Training completed: {result}")
         
 @app.function(
     image=image,
@@ -65,8 +59,8 @@ def rearrange_all_neurons(num_experts: int):
     from collections import OrderedDict
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = AutoModelForCausalLM.from_pretrained("TinyLlama/TinyLlama_v1.1", torch_dtype=torch.float16).to(device)
-    tokenizer = AutoTokenizer.from_pretrained("TinyLlama/TinyLlama_v1.1")
+    model = AutoModelForCausalLM.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0").to(device)
+    tokenizer = AutoTokenizer.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0")
     
     print("Model loaded! Beginning weight processing...")
     
@@ -101,12 +95,10 @@ def rearrange_all_neurons(num_experts: int):
     print(model.state_dict().keys())
     print("Loaded rearranged weights into model!")
     
-    # save the model 
     os.makedirs(f"/models/{num_experts}_Experts", exist_ok=True)
     model.save_pretrained(f"/models/{num_experts}_Experts")
     print(f"Saved model to /models/{num_experts}_Experts")
     
-    # make sure i didn't kill the model 
     text = "You are a helpful assistant. Hello, how are you today?"
     input_ids = tokenizer.encode(text, return_tensors="pt").to(model.device)
     output_ids = model.generate(input_ids, max_new_tokens=50)
@@ -147,14 +139,17 @@ def rearrange_weights_direct(weights, index, num_experts, weight_type):
 @app.function(
     image=image,
     volumes={"/outputs": experts},
-    timeout=30, # 30 seconds 
+    timeout=7200, # 2 hours 
 )
 def cluster_neurons(num_experts: int, layer_idx: int):
+    """
+    Cluster the neurons of a singel FFN
+    """
     os.makedirs(f"/outputs/{num_experts}_Experts", exist_ok=True)
     
     print(f"Clustering neurons for layer {layer_idx} into {num_experts} experts")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = AutoModelForCausalLM.from_pretrained("TinyLlama/TinyLlama_v1.1", torch_dtype=torch.float16).to(device)
+    model = AutoModelForCausalLM.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0").to(device)
     
     print("Model loaded!")
     
@@ -167,15 +162,21 @@ def cluster_neurons(num_experts: int, layer_idx: int):
     weights = torch.nn.functional.normalize(weights, p=2, dim=-1) # normalize each row to unit length
     weights = weights.detach().cpu().numpy() # shape: (5632, 2048)
     
+    # each cluster has exactly expert_size rows. 
     kmeans = KMeansConstrained(
-        n_clusters=num_experts, size_min=expert_size,
-        size_max=expert_size, random_state=0, n_jobs=16,
-        max_iter=1000)
+        n_clusters=num_experts, 
+        size_min=expert_size,
+        size_max=expert_size, 
+        random_state=0,
+        n_jobs=16,
+        max_iter=1000
+    )
     
     kmeans.fit(weights)
     
     file_name = f"/outputs/{num_experts}_Experts/layer_{layer_idx}_{num_experts}E.pth"
     res = torch.from_numpy(kmeans.labels_)
+    
     with open(file_name, "wb") as f:
         torch.save(res, f)
         

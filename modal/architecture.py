@@ -9,7 +9,8 @@ from transformers.models.llama.modeling_llama import (
     LlamaMLP,
     LlamaModel,
     LlamaRMSNorm,
-    LlamaForCausalLM
+    LlamaForCausalLM,
+    LlamaForSequenceClassification
 )
 
 class MoELlamaConfig(LlamaConfig):
@@ -39,7 +40,7 @@ class MoELlamaConfig(LlamaConfig):
         # EMoE-specific settings
         split_start_layer=10, # only partition last half 
         split_every_layer=2, # partition every other layer 
-        topk=1,                             
+        topk=4,                             
         n_expert=8,                         
         mode='EMoE',                         
         select='gate',
@@ -73,44 +74,49 @@ class MoELlamaConfig(LlamaConfig):
         self.select = select
         self.mode = mode
 
-
-# the partitioned MLP with top-1 gating
+# the partitioned MLP with top-k gating
 class EMoELlamaMLP(LlamaMLP):
     def __init__(self, config):
         super().__init__(config)
         self.config = config # clustering FFNs weights to construct the experts
+        self.k = self.config.topk
+        
+        up = self.up_proj.weight.detach().contiguous()
+        int_dim, hidden_dim = up.size()
+        s = self.config.intermediate_size // self.config.n_expert
+        self.s = s 
+        # the mean of each expert's weights 
+        G = up.view(self.config.n_expert, s, hidden_dim).mean(dim=1).T
+        # G will move to device as a buffer 
+        self.register_buffer("G", G, persistent=False)
+
         
     def forward(self, x):
-        # in gate proj, calculate the avg of activations in each expert, then select the top-k=1 expert for each token
-        gate_output = self.gate_proj(x)
-        intermediate_states = self.act_fn(gate_output) * self.up_proj(x) 
-        expert_scores = gate_output.reshape(x.shape[0], x.shape[1], self.config.n_expert, -1)
-        expert_scores = torch.mean(expert_scores, dim=-1)  # (bs, seq_len, n_expert)
-        expert_top1_indices = torch.topk(expert_scores, k=1, dim=-1).indices  # (bs, seq_len, 1)
-        expert_top1_mask = torch.zeros_like(expert_scores)  # (bs, seq_len, n_expert)
-        expert_top1_mask.scatter_(dim=-1, index=expert_top1_indices, value=1)
-        
-        expert_top1_mask = expert_top1_mask.repeat_interleave(
-            self.config.intermediate_size // self.config.n_expert, dim=-1)  # (bs, seq_len, intermediate_size)
-        intermediate_states = intermediate_states * expert_top1_mask
-        
-        down_proj = self.down_proj(intermediate_states)
-        return down_proj
+        # calculate gate_proj and up_proj, then take elementwise product 
+        # (that's just how swiglu works, unfortunate)
+        u = F.linear(x, self.up_proj.weight)
+        g = self.act_fn(F.linear(x, self.gate_proj.weight))
+        h = u * g
+        scores = torch.matmul(x, self.G)
+        topk_idx = scores.topk(self.k, dim=-1).indices
+        sel = torch.zeros_like(scores).scatter(-1, topk_idx, 1.0)
+        token_mask = sel.repeat_interleave(self.s, dim=-1)
+        h = h * token_mask.type_as(h)
+        y = F.linear(h, self.down_proj.weight)
+        return y
             
 class MoELlamaDecoderLayer(LlamaDecoderLayer):
-    def __init__(self, config: MoELlamaConfig, l_idx: int):
-        super().__init__(config)
-        # replace the default MLP with EMoE one when configured
+    def __init__(self, config: MoELlamaConfig, layer_idx: int):
+        super().__init__(config, layer_idx)
         if config.mode == "EMoE" \
-           and l_idx >= config.split_start_layer \
-           and (l_idx - config.split_start_layer) % config.split_every_layer == 0:
+           and layer_idx >= config.split_start_layer \
+           and (layer_idx - config.split_start_layer) % config.split_every_layer == 0:
             self.mlp = EMoELlamaMLP(config)
         else:
-            # fall back to the original LlamaMLP
             self.mlp = LlamaMLP(config)
 
 
-class MoELlamadModel(LlamaModel):
+class MoELlamaModel(LlamaModel):
     def __init__(self, config: MoELlamaConfig):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
@@ -127,4 +133,27 @@ class MoELlamadModel(LlamaModel):
 class MoELlamaForCausalLM(LlamaForCausalLM):
     def __init__(self, config: MoELlamaConfig):
         super().__init__(config)
-        self.model = MoELlamadModel(config)
+        self.model = MoELlamaModel(config)
+
+
+class EMoELlamaForSequenceClassification(LlamaForSequenceClassification):
+    """eMoE Llama model for sequence classification tasks"""
+    
+    def __init__(self, config: MoELlamaConfig):
+        super().__init__(config)
+        self.model = MoELlamaModel(config)
+        self.score = nn.Linear(config.hidden_size, config.num_labels, bias=False)
+        self.post_init()
+    
+    def get_expert_utilization_stats(self):
+        """Return statistics about expert usage across eMoE layers"""
+        stats = {}
+        for i, layer in enumerate(self.model.layers):
+            if hasattr(layer.mlp, 'config') and layer.mlp.config.mode == 'EMoE':
+                stats[f'layer_{i}'] = {
+                    'is_emoe': True,
+                    'num_experts': layer.mlp.config.n_expert
+                }
+            else:
+                stats[f'layer_{i}'] = {'is_emoe': False}
+        return stats

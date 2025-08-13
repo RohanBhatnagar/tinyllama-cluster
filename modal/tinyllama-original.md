@@ -26,5 +26,3 @@ LlamaForCausalLM(
   )
   (lm_head): Linear(in_features=2048, out_features=32000, bias=False)
 )
-
-New architecture including gating mechanism is below: 
