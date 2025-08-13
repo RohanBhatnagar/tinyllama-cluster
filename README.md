@@ -1,7 +1,7 @@
 # Doing better than LoRA fine-tuning on TinyLlama 
 
 This experiment aims to beat baseline LoRA by only employing chunks of the feed-forward networks (FFNs) in TinyLlama-1.1B-Chat-v1.0. It does the following without adding any new params (other than LoRA): 
-1. **Partitioning**: Split MLP layers into N uniform clusters based on their weight rows, as similar rows will have similar activations. 
+1. **Partitioning**: MLPs in LLMs are very sparsely activated. We can partition them into N uniform clusters based on their rows, as similar rows will have similar activations. 
 2. **Model Surgery**: Rearrange rows so that clusters are contiguous in memory. 
 3. **Routing**: Implement top-k routing during inference, sending tokens to FFN partitions whose activation is among the top-k highest partition activations. 
 4. **Fine-tuning**: Finetune the modified and baseline models using LoRA. 
