@@ -13,7 +13,7 @@ from transformers.models.llama.modeling_llama import (
     LlamaForSequenceClassification
 )
 
-class MoELlamaConfig(LlamaConfig):
+class ClusteredLlamaConfig(LlamaConfig):
     keys_to_ignore_at_inference = ["past_key_values"]
 
     def __init__(
@@ -37,7 +37,6 @@ class MoELlamaConfig(LlamaConfig):
         rope_theta=10000.0,
         rope_scaling=None,
 
-        # EMoE-specific settings
         split_start_layer=10, # only partition last half 
         split_every_layer=2, # partition every other layer 
         topk=4,                             
@@ -75,7 +74,7 @@ class MoELlamaConfig(LlamaConfig):
         self.mode = mode
 
 # the partitioned MLP with top-k gating
-class EMoELlamaMLP(LlamaMLP):
+class ClusteredLlamaMLP(LlamaMLP):
     def __init__(self, config):
         super().__init__(config)
         self.config = config # clustering FFNs weights to construct the experts
@@ -105,48 +104,45 @@ class EMoELlamaMLP(LlamaMLP):
         y = F.linear(h, self.down_proj.weight)
         return y
             
-class MoELlamaDecoderLayer(LlamaDecoderLayer):
-    def __init__(self, config: MoELlamaConfig, layer_idx: int):
+class ClusteredLlamaDecoderLayer(LlamaDecoderLayer):
+    def __init__(self, config: ClusteredLlamaConfig, layer_idx: int):
         super().__init__(config, layer_idx)
         if config.mode == "EMoE" \
            and layer_idx >= config.split_start_layer \
            and (layer_idx - config.split_start_layer) % config.split_every_layer == 0:
-            self.mlp = EMoELlamaMLP(config)
+            self.mlp = ClusteredLlamaMLP(config)
         else:
             self.mlp = LlamaMLP(config)
 
 
-class MoELlamaModel(LlamaModel):
-    def __init__(self, config: MoELlamaConfig):
+class ClusteredLlamaModel(LlamaModel):
+    def __init__(self, config: ClusteredLlamaConfig):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         # now every layer will pick the right MLP
         self.layers = nn.ModuleList(
-            [MoELlamaDecoderLayer(config, i) for i in range(config.num_hidden_layers)]
+            [ClusteredLlamaDecoderLayer(config, i) for i in range(config.num_hidden_layers)]
         )
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_init()
 
 
-class MoELlamaForCausalLM(LlamaForCausalLM):
-    def __init__(self, config: MoELlamaConfig):
+class ClusteredLlamaForCausalLM(LlamaForCausalLM):
+    def __init__(self, config: ClusteredLlamaConfig):
         super().__init__(config)
-        self.model = MoELlamaModel(config)
+        self.model = ClusteredLlamaModel(config)
 
 
-class EMoELlamaForSequenceClassification(LlamaForSequenceClassification):
-    """eMoE Llama model for sequence classification tasks"""
-    
-    def __init__(self, config: MoELlamaConfig):
+class ClusteredLlamaForSequenceClassification(LlamaForSequenceClassification):    
+    def __init__(self, config: ClusteredLlamaConfig):
         super().__init__(config)
-        self.model = MoELlamaModel(config)
+        self.model = ClusteredLlamaModel(config)
         self.score = nn.Linear(config.hidden_size, config.num_labels, bias=False)
         self.post_init()
     
     def get_expert_utilization_stats(self):
-        """Return statistics about expert usage across eMoE layers"""
         stats = {}
         for i, layer in enumerate(self.model.layers):
             if hasattr(layer.mlp, 'config') and layer.mlp.config.mode == 'EMoE':

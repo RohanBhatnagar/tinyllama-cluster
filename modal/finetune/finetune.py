@@ -1,6 +1,6 @@
 """
-Unified Training Script for TinyLlama Baseline and eMoE Models
-Supports both baseline LoRA fine-tuning and eMoE model fine-tuning on RTE dataset.
+Common Training Script for TinyLlama Baseline and Partitioned Models
+Supports both baseline LoRA fine-tuning and modified model fine-tuning on RTE dataset.
 """
 
 import os
@@ -18,7 +18,7 @@ image = (
     .pip_install("pip==24.0")
     .pip_install_from_requirements("requirements.txt")
     .add_local_file("../architecture.py", remote_path="/root/architecture.py")
-    .add_local_file("../emoe.py", remote_path="/root/emoe.py")
+    .add_local_file("../surgery.py", remote_path="/root/surgery.py")
 )
 
 with image.imports():
@@ -34,69 +34,36 @@ with image.imports():
     from datasets import load_dataset
     import evaluate
     from peft import get_peft_model, LoraConfig, TaskType
-    from architecture import MoELlamaConfig, EMoELlamaForSequenceClassification
+    from architecture import ClusteredLlamaConfig, ClusteredLlamaForSequenceClassification
 
 @app.local_entrypoint()
 def main(
-    mode: str = "baseline",  # "baseline", "emoe", or "compare"
+    mode: str = "baseline",  # "baseline", "clustered", or "compare"
     num_experts: int = 8,
     topk: int = 1,
     compare_original: bool = True
-):
-    """
-    Main entry point for training experiments
-    
-    Args:
-        mode: "baseline" for standard LoRA, "emoe" for eMoE model, "compare" for both
-        num_experts: Number of experts for eMoE mode
-        topk: Top-k routing for eMoE mode  
-        compare_original: Whether to evaluate original model first
-    """
-    print(f"🚀 Starting {mode.upper()} training experiment...")
-    
+):    
     results = {}
     
-    if mode == "compare" or compare_original:
-        print("\n" + "="*60)
-        print("EVALUATING ORIGINAL MODEL")
-        print("="*60)
-        original_result = evaluate_original.remote()
-        results["original"] = original_result
-        print(f"Original model results: {original_result}")
-    
     if mode in ["baseline", "compare"]:
-        print("\n" + "="*60)
-        print("TRAINING BASELINE MODEL")
-        print("="*60)
         baseline_result = train_baseline.remote()
         results["baseline"] = baseline_result
-        print(f"Baseline results: {baseline_result}")
     
-    if mode in ["emoe", "compare"]:
-        print("\n" + "="*60)
-        print("TRAINING eMoE MODEL")
-        print("="*60)
-        emoe_result = train_emoe.remote(num_experts, topk)
-        results["emoe"] = emoe_result
-        print(f"eMoE results: {emoe_result}")
+    if mode in ["clustered", "compare"]:
+        clustered_result = train_clustered.remote(num_experts, topk)
+        results["clustered"] = clustered_result
     
-    print("\n" + "="*60)
-    print("EXPERIMENT SUMMARY")
-    print("="*60)
     for model_type, result in results.items():
         if result:
             accuracy = result.get('eval_accuracy', 'N/A')
             print(f"{model_type.upper():>12}: {accuracy:.4f}" if isinstance(accuracy, float) else f"{model_type.upper():>12}: {accuracy}")
-    print("="*60)
     
     return results
 
 models = modal.Volume.from_name("tinyllama-models", create_if_missing=True)
 data = modal.Volume.from_name("tinyllama-data", create_if_missing=True)
 
-# Shared configuration and helper functions
-def get_shared_training_args(output_dir: str) -> TrainingArguments:
-    """Get standard training arguments used by both baseline and eMoE"""
+def get_shared_training_args(output_dir: str):
     return TrainingArguments(
         output_dir=output_dir,
         evaluation_strategy="epoch",
@@ -115,8 +82,7 @@ def get_shared_training_args(output_dir: str) -> TrainingArguments:
         report_to=None,
     )
 
-def get_shared_lora_config() -> LoraConfig:
-    """Get standard LoRA configuration used by both models"""
+def get_shared_lora_config():
     return LoraConfig(
         task_type=TaskType.SEQ_CLS,
         r=32,
@@ -127,7 +93,6 @@ def get_shared_lora_config() -> LoraConfig:
     )
 
 def setup_tokenizer_and_data():
-    """Setup tokenizer and dataset preprocessing - shared by all models"""
     tokenizer = AutoTokenizer.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0")
     
     if tokenizer.pad_token is None:
@@ -144,7 +109,6 @@ def setup_tokenizer_and_data():
     return tokenizer, train_dataset, eval_dataset
 
 def get_compute_metrics():
-    """Get metrics computation function - shared by all models"""
     accuracy_metric = evaluate.load("accuracy")
     
     def compute_metrics(eval_pred):
@@ -161,13 +125,11 @@ def get_compute_metrics():
     timeout=7200,
 )
 def evaluate_original():
-    """Evaluate the original TinyLlama model on RTE validation set"""
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     print("Loading original TinyLlama model...")
     model = AutoModelForSequenceClassification.from_pretrained(
         "TinyLlama/TinyLlama-1.1B-Chat-v1.0", 
-        torch_dtype=torch.float16, 
         num_labels=2
     )
     
@@ -196,13 +158,11 @@ def evaluate_original():
     timeout=7200,
 )
 def train_baseline():
-    """Train baseline TinyLlama with LoRA on RTE"""
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     print("Loading baseline TinyLlama model...")
     model = AutoModelForSequenceClassification.from_pretrained(
         "TinyLlama/TinyLlama-1.1B-Chat-v1.0", 
-        torch_dtype=torch.float16, 
         num_labels=2
     )
     
@@ -252,20 +212,19 @@ def train_baseline():
     gpu="A100",
     timeout=7200,
 )
-def train_emoe(num_experts: int = 8, topk: int = 1):
-    """Train eMoE TinyLlama with LoRA on RTE"""
+def train_clustered(num_experts: int = 8, topk: int = 1):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    # Load eMoE model
+    # Load clustered model
     try:
         model_path = f"/models/{num_experts}_Experts"
-        print(f"Loading eMoE model from: {model_path}")
-        config = MoELlamaConfig.from_pretrained(model_path)
-        model = EMoELlamaForSequenceClassification.from_pretrained(model_path, config=config)
-        print(f"Successfully loaded eMoE model with {config.n_expert} experts, top-{config.topk} routing")
+        print(f"Loading clustered model from: {model_path}")
+        config = ClusteredLlamaConfig.from_pretrained(model_path)
+        model = ClusteredLlamaForSequenceClassification.from_pretrained(model_path, config=config)
+        print(f"Successfully loaded clustered model with {config.n_expert} experts, top-{config.topk} routing")
     except Exception as e:
-        print(f"Error loading eMoE model: {e}")
-        print(f"Make sure you have run the eMoE conversion first to create {model_path}")
+        print(f"Error loading clustered model: {e}")
+        print(f"Make sure you have run the clustered conversion first to create {model_path}")
         return None
     
     tokenizer, train_dataset, eval_dataset = setup_tokenizer_and_data()
@@ -276,23 +235,8 @@ def train_emoe(num_experts: int = 8, topk: int = 1):
     model = get_peft_model(model, get_shared_lora_config())
     model.print_trainable_parameters()
     
-    # Print eMoE architecture info
-    print("\n" + "="*50)
-    print("eMoE MODEL ARCHITECTURE")
-    print("="*50)
-    expert_stats = model.get_expert_utilization_stats()
-    emoe_layers = [k for k, v in expert_stats.items() if v.get('is_emoe', False)]
-    print(f"Total layers: {len(expert_stats)}")
-    print(f"eMoE layers: {len(emoe_layers)}")
-    print(f"Dense layers: {len(expert_stats) - len(emoe_layers)}")
-    print(f"Experts per eMoE layer: {config.n_expert}")
-    print(f"Top-k routing: {config.topk}")
-    print("LoRA rank: 32, alpha: 64")
-    print("Target modules: q_proj, v_proj")
-    print("="*50)
-    
     trainer = Trainer(
-        args=get_shared_training_args("/data/emoe_results"),
+        args=get_shared_training_args("/data/clustered_results"),
         model=model,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
@@ -301,24 +245,16 @@ def train_emoe(num_experts: int = 8, topk: int = 1):
         data_collator=DataCollatorWithPadding(tokenizer=tokenizer),
     )
     
-    print("Starting eMoE LoRA fine-tuning...")
+    print("Starting clustered LoRA fine-tuning...")
     trainer.train()
     
     eval_results = trainer.evaluate()
-    print(f"eMoE fine-tuned accuracy: {eval_results['eval_accuracy']:.4f}")
+    print(f"Clustered fine-tuned accuracy: {eval_results['eval_accuracy']:.4f}")
     
     # Save model
-    os.makedirs("/models/emoe_finetuned", exist_ok=True)
-    model.save_pretrained("/models/emoe_finetuned")
-    tokenizer.save_pretrained("/models/emoe_finetuned")
-    print("eMoE model saved to /models/emoe_finetuned")
-    
-    # Expert analysis
-    print("\n" + "="*50)
-    print("TRAINING COMPLETED - EXPERT ANALYSIS")
-    print("="*50)
-    final_stats = model.get_expert_utilization_stats()
-    print(f"Final model has {len([v for v in final_stats.values() if v.get('is_emoe', False)])} eMoE layers")
-    print("="*50)
+    os.makedirs("/models/clustered_finetuned", exist_ok=True)
+    model.save_pretrained("/models/clustered_finetuned")
+    tokenizer.save_pretrained("/models/clustered_finetuned")
+    print("Model saved.")
     
     return eval_results 

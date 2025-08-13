@@ -26,7 +26,7 @@ with image.imports():
 experts = modal.Volume.from_name("tinyllama-experts", create_if_missing=True)
 models = modal.Volume.from_name("tinyllama-models", create_if_missing=True)
 
-app = modal.App("emoe")
+app = modal.App("app")
 
 @app.local_entrypoint()
 def main(
