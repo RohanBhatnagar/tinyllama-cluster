@@ -9,7 +9,7 @@ This experiment aims to beat baseline LoRA by only employing chunks of the feed-
 ## Results: 
 
 I fine-tuned TinyLlama-1.1B on Recognizing Textual Entanglement (RTE) a subset of GLUE, and observed the following: 
-1. Fine-tuning the modified LLM with LoRA performs 1-2% better than the vanilla model. 
+1. Fine-tuning the modified LLM with LoRA performs 1-2% better than the LoRA fine-tuned vanilla model. 
 2. Modified TinyLlama achieves the accuracy of the vanilla model within 3/5 epochs and continues to increase. (N=32, k=16)
 \
 \
